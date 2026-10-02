@@ -118,7 +118,7 @@ class FileDropPanel(tk.Frame):
 class CompareApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("ILE vs Topos Compare 1.1 — Portable (không cần Excel)")
+        self.title("ILE vs Topos Compare 2.0 — Portable (không cần Excel)")
         self.geometry("920x720")
         self.minsize(780, 580)
         self.configure(bg=BG)
@@ -131,14 +131,14 @@ class CompareApp(tk.Tk):
         header.pack(fill="x")
         tk.Label(
             header,
-            text="ILE vs Topos Compare 1.1",
+            text="ILE vs Topos Compare 2.0",
             font=("Segoe UI Semibold", 16),
             fg="white",
             bg=NAVY,
         ).pack(anchor="w", padx=16, pady=(12, 0))
         tk.Label(
             header,
-            text="Key: Ngày · Location/Tên Cửa Hàng · Type · Item No/Mã Nội Bộ   ·   Lệch = Topos − Item Ledger",
+            text="Key: Ngày · Location · Type · Mã M   ·   Topos: HĐ Bán/Trả + Mã CT   ·   Lệch = Topos − ILE",
             font=("Segoe UI", 10),
             fg="#d6e5fc",
             bg=NAVY,

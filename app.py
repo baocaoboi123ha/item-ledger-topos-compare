@@ -38,8 +38,13 @@ st.markdown(
 3. **Type** — cột `Type` (ST, CP, …)
 4. **Item No / Mã Nội Bộ** — `Item No.` ↔ `Ma Noi Bo`
 
+**Topos (Phương Thức):**
+- **HĐ Trả** khớp **HĐ Bán** (Ma Hoa Don Goc, cùng SL) → không cộng bán/trả (net 0 tại ngày bán).
+- **HĐ Bán** cùng **Mã chứng từ** → net theo mã CT (vd. +N và −N cùng CT = 0) rồi gom theo ngày/key.
+
 **Cột kết quả:** Ngày, Location, Type, Item No/Mã Nội Bộ,
-Quantity Item Ledger, Quantity Topos, **Lệch = Topos − Item Ledger**.
+Quantity Item Ledger, Quantity Topos, **Lệch = Topos − Item Ledger**,
+**Unit cost** (Cost Amount ÷ Qty trên ILE theo mã M; không có thì 0).
 Chỉ xuất các key **lệch** (không in dòng khớp).
 
 File tải về **gộp file gốc + kết quả**: sheet nguyên bản giữ nguyên thứ tự ở trước,

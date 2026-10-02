@@ -17,7 +17,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.filters import AutoFilter
 
-ENGINE_VERSION = "1.1"
+ENGINE_VERSION = "2.0"
 QTY_TOLERANCE = 0.001
 OUTPUT_SUFFIX = " - ILE vs Topos.xlsx"
 RESULT_SHEET = "Ket qua lech"
@@ -32,6 +32,7 @@ RESULT_HEADERS = (
     "Quantity Item Ledger",
     "Quantity Topos",
     "Lệch (Topos - Item Ledger)",
+    "Unit cost",
     "Status",
 )
 SUMMARY_HEADERS = (
@@ -60,6 +61,13 @@ ILE_ALIASES: dict[str, tuple[str, ...]] = {
     "item": ("itemno", "manoibo", "masanpham"),
     "qty": ("quantity", "soluong", "qty"),
 }
+ILE_COST_ALIASES = (
+    "costamountactual",
+    "costamount",
+    "cost",
+    "giavon",
+    "thanhtiengia",
+)
 TOPOS_ALIASES: dict[str, tuple[str, ...]] = {
     "date": ("ngay", "date", "postingdate"),
     "location": ("tencuahang", "locationcode", "location"),
@@ -67,6 +75,13 @@ TOPOS_ALIASES: dict[str, tuple[str, ...]] = {
     "item": ("manoibo", "itemno", "masanpham"),
     "qty": ("soluong", "quantity", "qty"),
 }
+TOPOS_OPTIONAL_ALIASES: dict[str, tuple[str, ...]] = {
+    "method": ("phuongthuc", "method", "hinhthuc"),
+    "doc_no": ("machungtu", "madon", "sochungtu", "documentno"),
+    "orig_doc": ("mahoadongoc", "hoadongoc", "madonhanggoc"),
+}
+TOPOS_METHOD_BAN = "hdban"
+TOPOS_METHOD_TRA = "hdtra"
 REQUIRED_ROLES = ("date", "location", "type", "item", "qty")
 
 _THIN = Side(style="thin", color="808080")
@@ -202,6 +217,70 @@ def resolve_columns(
     return resolved
 
 
+def resolve_optional_columns(
+    headers: Iterable,
+    alias_map: dict[str, tuple[str, ...]],
+) -> dict[str, int]:
+    norm_index: dict[str, int] = {}
+    for i, header in enumerate(headers):
+        key = normalize_header(header)
+        if key and key not in norm_index:
+            norm_index[key] = i
+    resolved: dict[str, int] = {}
+    for role, keys in alias_map.items():
+        for key in keys:
+            if key in norm_index:
+                resolved[role] = norm_index[key]
+                break
+    return resolved
+
+
+def _topos_method_key(value) -> str:
+    return normalize_header(str(value or ""))
+
+
+def resolve_cost_column(headers: Iterable) -> int | None:
+    norm_index: dict[str, int] = {}
+    for i, header in enumerate(headers):
+        key = normalize_header(header)
+        if key and key not in norm_index:
+            norm_index[key] = i
+    for key in ILE_COST_ALIASES:
+        if key in norm_index:
+            return norm_index[key]
+    return None
+
+
+def _build_item_unit_costs(
+    rows: list[tuple],
+    cols: dict[str, int],
+    cost_col: int | None,
+    log: LogFn,
+) -> dict[str, float]:
+    """Unit cost theo mã M = tổng Cost Amount / tổng Qty (sheet Item Ledger)."""
+    if cost_col is None:
+        log("Item Ledger: không có cột Cost Amount — Unit cost = 0.")
+        return {}
+    item_cost: dict[str, float] = defaultdict(float)
+    item_qty: dict[str, float] = defaultdict(float)
+    for row in rows[1:]:
+        if row is None or all(c is None or str(c).strip() == "" for c in row):
+            continue
+        item = key_text(row[cols["item"]])
+        if not item:
+            continue
+        qty = to_float(row[cols["qty"]])
+        cost = to_float(row[cost_col])
+        item_cost[item] += cost
+        item_qty[item] += qty
+    unit: dict[str, float] = {}
+    for item, total_qty in item_qty.items():
+        if abs(total_qty) > QTY_TOLERANCE:
+            unit[item] = item_cost[item] / total_qty
+    log(f"Item Ledger: unit cost cho {len(unit)} mã M (Cost Amount / Qty).")
+    return unit
+
+
 def _find_sheet(wb, aliases: tuple[str, ...], label: str, fallback_single: bool) -> str:
     by_norm = {normalize_sheet(name): name for name in wb.sheetnames}
     for alias in aliases:
@@ -259,6 +338,110 @@ def _pivot(
     return pivot
 
 
+def _pivot_topos(
+    rows: list[tuple],
+    cols: dict[str, int],
+    optional: dict[str, int],
+    log: LogFn,
+) -> dict[tuple, float]:
+    """Topos qty theo key sau 2 rule Phương Thức / Mã chứng từ."""
+    if not rows:
+        raise CompareError("Topos: không có dòng dữ liệu.")
+    method_col = optional.get("method")
+    doc_col = optional.get("doc_no")
+    orig_col = optional.get("orig_doc")
+    if method_col is None:
+        log("Topos: không có cột Phương Thức — gom qty thường (không áp rule HĐ Bán/Trả).")
+        return _pivot(rows, cols, "Topos", log)
+
+    pivot: dict[tuple, float] = defaultdict(float)
+    # Rule 2: net theo (ngày, key, mã chứng từ) chỉ với HĐ Bán
+    ban_by_doc: dict[tuple, float] = defaultdict(float)
+    # Rule 1: tổng bán theo (mã CT gốc, loc, type, item) để khớp HĐ Trả
+    sale_by_doc: dict[tuple, tuple[date, float]] = {}
+    return_rows: list[tuple[date, str, str, str, float, str]] = []
+    skipped_date = skipped_item = 0
+    other_rows = 0
+
+    for row in rows[1:]:
+        if row is None or all(c is None or str(c).strip() == "" for c in row):
+            continue
+        d = parse_date(row[cols["date"]])
+        if d is None:
+            skipped_date += 1
+            continue
+        item = key_text(row[cols["item"]])
+        if not item:
+            skipped_item += 1
+            continue
+        loc = key_text(row[cols["location"]])
+        typ = key_text(row[cols["type"]])
+        qty = to_float(row[cols["qty"]])
+        method = _topos_method_key(row[method_col])
+        doc_no = key_text(row[doc_col]) if doc_col is not None else ""
+        orig_doc = key_text(row[orig_col]) if orig_col is not None else ""
+
+        if method == TOPOS_METHOD_BAN:
+            if not doc_no:
+                pivot[(d, loc, typ, item)] += qty
+                continue
+            doc_key = (d, loc, typ, item, doc_no)
+            ban_by_doc[doc_key] += qty
+            sale_key = (doc_no, loc, typ, item)
+            if sale_key not in sale_by_doc:
+                sale_by_doc[sale_key] = (d, qty)
+            else:
+                prev_d, prev_q = sale_by_doc[sale_key]
+                sale_by_doc[sale_key] = (prev_d, prev_q + qty)
+            continue
+
+        if method == TOPOS_METHOD_TRA:
+            return_rows.append((d, loc, typ, item, qty, orig_doc))
+            continue
+
+        pivot[(d, loc, typ, item)] += qty
+        other_rows += 1
+
+    void_ban_docs = 0
+    for (d, loc, typ, item, _doc), net in ban_by_doc.items():
+        pivot[(d, loc, typ, item)] += net
+        if abs(net) <= QTY_TOLERANCE:
+            void_ban_docs += 1
+
+    paired_tra = unmatched_tra = 0
+    for ret_d, loc, typ, item, qty, orig_doc in return_rows:
+        ret_n = abs(qty)
+        if ret_n <= QTY_TOLERANCE:
+            continue
+        sale_key = (orig_doc, loc, typ, item) if orig_doc else None
+        sale_d: date | None = None
+        sale_n = 0.0
+        if sale_key and sale_key in sale_by_doc:
+            sale_d, sale_n = sale_by_doc[sale_key]
+        if (
+            sale_d is not None
+            and abs(sale_n - ret_n) <= QTY_TOLERANCE
+            and sale_n > QTY_TOLERANCE
+        ):
+            pivot[(sale_d, loc, typ, item)] -= sale_n
+            sale_by_doc[sale_key] = (sale_d, 0.0)
+            paired_tra += 1
+            continue
+        pivot[(ret_d, loc, typ, item)] += qty
+        unmatched_tra += 1
+
+    if skipped_date:
+        log(f"Topos: bỏ qua {skipped_date} dòng không đọc được ngày.")
+    if skipped_item:
+        log(f"Topos: bỏ qua {skipped_item} dòng thiếu Item No/Mã Nội Bộ.")
+    log(
+        f"Topos: HĐ Bán net theo mã CT (rule 2, doc net=0: {void_ban_docs}); "
+        f"HĐ Trả khớp bán (rule 1): {paired_tra}, HĐ Trả còn lại: {unmatched_tra}; "
+        f"dòng khác: {other_rows} → {len(pivot)} key."
+    )
+    return pivot
+
+
 def _qty_mismatch(a: float, b: float) -> bool:
     return abs(b - a) > QTY_TOLERANCE
 
@@ -275,14 +458,19 @@ def _load_pivots(
     ile_path: Path,
     topos_path: Path | None,
     log: LogFn,
-) -> tuple[dict[tuple, float], dict[tuple, float]]:
+) -> tuple[dict[tuple, float], dict[tuple, float], dict[str, float]]:
     ile_wb = load_workbook(ile_path, read_only=True, data_only=True)
     try:
         same_file = topos_path is None or Path(topos_path).resolve() == Path(ile_path).resolve()
         ile_sheet = _find_sheet(ile_wb, ILE_SHEET_ALIASES, "Item Ledger Entries", fallback_single=not same_file)
         ile_rows = _read_sheet(ile_wb, ile_sheet)
         log(f"Item Ledger: sheet '{ile_sheet}' ({ile_path.name})")
-        ile_cols = resolve_columns(ile_rows[0] if ile_rows else (), ILE_ALIASES, "Item Ledger")
+        ile_header = ile_rows[0] if ile_rows else ()
+        ile_cols = resolve_columns(ile_header, ILE_ALIASES, "Item Ledger")
+        cost_col = resolve_cost_column(ile_header)
+        if cost_col is not None:
+            log(f"Item Ledger: cột Cost Amount = '{ile_header[cost_col]}'.")
+        item_unit_cost = _build_item_unit_costs(ile_rows, ile_cols, cost_col, log)
         ile_pivot = _pivot(ile_rows, ile_cols, "Item Ledger", log)
 
         if same_file:
@@ -299,16 +487,19 @@ def _load_pivots(
                 log(f"Topos: sheet '{topos_sheet}' ({Path(topos_path).name})")
             finally:
                 topos_wb.close()
-        topos_cols = resolve_columns(topos_rows[0] if topos_rows else (), TOPOS_ALIASES, "Topos")
-        topos_pivot = _pivot(topos_rows, topos_cols, "Topos", log)
+        topos_header = topos_rows[0] if topos_rows else ()
+        topos_cols = resolve_columns(topos_header, TOPOS_ALIASES, "Topos")
+        topos_optional = resolve_optional_columns(topos_header, TOPOS_OPTIONAL_ALIASES)
+        topos_pivot = _pivot_topos(topos_rows, topos_cols, topos_optional, log)
     finally:
         ile_wb.close()
-    return ile_pivot, topos_pivot
+    return ile_pivot, topos_pivot, item_unit_cost
 
 
 def build_mismatch_rows(
     ile_pivot: dict[tuple, float],
     topos_pivot: dict[tuple, float],
+    item_unit_cost: dict[str, float] | None = None,
 ) -> list[tuple]:
     keys = set(ile_pivot) | set(topos_pivot)
     rows: list[tuple] = []
@@ -320,6 +511,7 @@ def build_mismatch_rows(
         if not _qty_mismatch(ile_qty, tp_qty):
             continue
         d, loc, typ, item = key
+        unit_cost = (item_unit_cost or {}).get(item, 0.0)
         rows.append(
             (
                 d,
@@ -329,6 +521,7 @@ def build_mismatch_rows(
                 ile_qty,
                 tp_qty,
                 tp_qty - ile_qty,
+                unit_cost,
                 _status(ile_qty, tp_qty, in_ile, in_tp),
             )
         )
@@ -360,7 +553,7 @@ def _style_header(ws, headers: tuple[str, ...]) -> None:
 def _write_table(ws, headers: tuple[str, ...], rows: list[tuple], qty_cols: set[int]) -> None:
     _style_header(ws, headers)
     for r_idx, row in enumerate(rows, 2):
-        status = row[7] if len(row) > 7 else ""
+        status = row[8] if len(row) > 8 else ""
         fill = None
         if status == "Chỉ có Item Ledger":
             fill = _MISS_TP
@@ -377,7 +570,7 @@ def _write_table(ws, headers: tuple[str, ...], rows: list[tuple], qty_cols: set[
                 cell.number_format = QTY_FMT
             if c_idx == 1 and isinstance(value, date):
                 cell.number_format = "YYYY-MM-DD"
-    widths = [14, 14, 10, 22, 22, 18, 26, 22]
+    widths = [14, 14, 10, 22, 22, 18, 26, 16, 22]
     for i, width in enumerate(widths[: len(headers)], 1):
         ws.column_dimensions[get_column_letter(i)].width = width
     last_col = get_column_letter(len(headers))
@@ -465,7 +658,7 @@ def write_result_workbook(
             _append_workbook_sheets(extra, wb, used, log)
 
         ws = wb.create_sheet(RESULT_SHEET)
-        _write_table(ws, RESULT_HEADERS, mismatch, {5, 6, 7})
+        _write_table(ws, RESULT_HEADERS, mismatch, {5, 6, 7, 8})
         ws2 = wb.create_sheet(SUMMARY_SHEET)
         _write_table(ws2, SUMMARY_HEADERS, _summary_rows(mismatch), {5, 6, 7})
 
@@ -503,13 +696,18 @@ def compare_workbook(
     dest = Path(output_path) if output_path else source.with_name(source.stem + OUTPUT_SUFFIX)
     _log(f"Engine {ENGINE_VERSION}")
     _log("Key: Ngày + Location/Tên Cửa Hàng + Type + Item No/Mã Nội Bộ")
+    _log(
+        "Topos: (1) HĐ Trả = HĐ Bán qua Ma Hoa Don Goc, cùng SL → 0 tại ngày bán; "
+        "(2) HĐ Bán cùng mã CT → net theo mã CT rồi cộng theo ngày/key"
+    )
     _log("Lệch = Quantity Topos − Quantity Item Ledger")
+    _log("Unit cost = Cost Amount / Qty trên ILE (theo mã M; không có thì 0)")
 
-    ile_pivot, topos_pivot = _load_pivots(source, extra, _log)
-    mismatch = build_mismatch_rows(ile_pivot, topos_pivot)
-    only_ile = sum(1 for r in mismatch if r[7] == "Chỉ có Item Ledger")
-    only_tp = sum(1 for r in mismatch if r[7] == "Chỉ có Topos")
-    both = sum(1 for r in mismatch if r[7] == "Lệch số lượng")
+    ile_pivot, topos_pivot, item_unit_cost = _load_pivots(source, extra, _log)
+    mismatch = build_mismatch_rows(ile_pivot, topos_pivot, item_unit_cost)
+    only_ile = sum(1 for r in mismatch if r[8] == "Chỉ có Item Ledger")
+    only_tp = sum(1 for r in mismatch if r[8] == "Chỉ có Topos")
+    both = sum(1 for r in mismatch if r[8] == "Lệch số lượng")
     _log(
         f"Key ILE {len(ile_pivot)}, Topos {len(topos_pivot)}, "
         f"lệch {len(mismatch)} (cả hai {both}, chỉ ILE {only_ile}, chỉ Topos {only_tp})."
@@ -527,7 +725,8 @@ def compare_workbook(
                 "Quantity Item Ledger": row[4],
                 "Quantity Topos": row[5],
                 "Lệch (Topos - Item Ledger)": round(row[6], 6),
-                "Status": row[7],
+                "Unit cost": round(row[7], 6),
+                "Status": row[8],
             }
         )
     return {
